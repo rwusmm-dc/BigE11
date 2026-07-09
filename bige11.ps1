@@ -41,11 +41,6 @@ Register-EngineEvent -SupportEvent PowerShell.Exiting -Action {
     } -ArgumentList $TempBase
 } | Out-Null
 
-trap {
-    Cleanup-Temp
-    break
-}
-
 function Set-RegistryValue {
     param (
         [string]$path,
@@ -60,15 +55,45 @@ function Set-RegistryValue {
     }
 }
 
-function Remove-RegistryValue {
+function Remove-RegistryKey {
     param (
         [string]$path
     )
     try {
         & 'reg' 'delete' $path '/f' | Out-Null
     } catch {
+        Write-Output "Error removing registry key: $_"
+    }
+}
+
+function Remove-RegistryValue {
+    param (
+        [string]$path,
+        [string]$name
+    )
+    try {
+        & 'reg' 'delete' $path '/v' $name '/f' | Out-Null
+    } catch {
         Write-Output "Error removing registry value: $_"
     }
+}
+
+function Set-ServiceStart {
+    param (
+        [string]$service,
+        [int]$startType
+    )
+    Set-RegistryValue "HKLM\zSYSTEM\ControlSet001\Services\$service" "Start" "REG_DWORD" $startType
+}
+
+# Check for wallpaper
+$WallpaperSource = "$PSScriptRoot\w1.jpg"
+$UseWallpaper = $false
+if (Test-Path $WallpaperSource) {
+    $UseWallpaper = $true
+    Write-Output "Found w1.jpg - will integrate as default wallpaper"
+} else {
+    Write-Output "No w1.jpg found - skipping wallpaper integration"
 }
 
 if ((Get-ExecutionPolicy) -eq 'Restricted') {
@@ -108,6 +133,8 @@ $Host.UI.RawUI.WindowTitle = "BigE11"
 Clear-Host
 Write-Output "BigE11 - Windows 11 Optimization Script"
 Write-Output "Temp folder: $TempBase"
+Write-Output "WARNING: Edge WebView2 is completely removed from WinSxS."
+Write-Output "This may affect Windows Update stability."
 
 $hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
 do {
@@ -138,8 +165,8 @@ if ((Test-Path "$DriveLetter\sources\boot.wim") -eq $false -or (Test-Path "$Driv
     }
 }
 
-Write-Output "Step 2/11: Copying Windows image..."
-Copy-Item -Path "$DriveLetter\*" -Destination "$BigE11Dir" -Recurse -Force | Out-Null
+Write-Output "Step 2/11: Copying Windows image (using robocopy for speed)..."
+robocopy "$DriveLetter" "$BigE11Dir" /E /COPY:DAT /MT:8 /NP /NFL /NDL /NJH /NJS
 Set-ItemProperty -Path "$BigE11Dir\sources\install.esd" -Name IsReadOnly -Value $false > $null 2>&1
 Remove-Item "$BigE11Dir\sources\install.esd" > $null 2>&1
 Write-Output "Copy complete."
@@ -206,7 +233,8 @@ Remove-Item -Path "$ScratchDir\Program Files (x86)\Microsoft\Edge" -Recurse -For
 Remove-Item -Path "$ScratchDir\Program Files (x86)\Microsoft\EdgeUpdate" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
 Remove-Item -Path "$ScratchDir\Program Files (x86)\Microsoft\EdgeCore" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
 
-Write-Output "Removing Edge WebView2..."
+Write-Output "WARNING: Removing Edge WebView2 from WinSxS - This may break Windows Update!"
+Write-Output "If you experience issues, run: sfc /scannow"
 if ($architecture -eq 'amd64') {
     $foldersToRemove = Get-ChildItem -Path "$ScratchDir\Windows\WinSxS" -Filter "amd64_microsoft-edge-webview_31bf3856ad364e35*" -Directory -ErrorAction SilentlyContinue
     
@@ -249,25 +277,27 @@ $featuresToRemove = @(
 )
 foreach ($feature in $featuresToRemove) {
     Write-Output "Removing feature: $feature"
-    & dism "/Image:$ScratchDir" "/Disable-Feature" "/FeatureName:$feature" "/Remove" "/Quiet" | Out-Null
+    $result = & dism "/Image:$ScratchDir" "/Disable-Feature" "/FeatureName:$feature" "/Remove" "/Quiet"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Failed to remove feature: $feature (exit code: $LASTEXITCODE)"
+    }
 }
 
-Write-Output "Step 7/11: Disabling Services..."
+Write-Output "Step 7/11: Disabling Services (via registry - offline image)..."
 $servicesToDisable = @(
     "DiagTrack","diagnosticshub.standardcollector.service","DPS","WdiServiceHost","WdiSystemHost",
     "TrkWks","Fax","lfsvc","RetailDemo","XblAuthManager","XblGameSave","XboxNetApiSvc","XboxGipSvc",
-    "XboxGameCallableUI","PcaSvc","ParentalControls","WpnUserService_*","BcastDVRUserService_*",
-    "MessagingService_*","PimIndexMaintenanceSvc_*","UnistoreSvc_*","UserDataSvc_*","WSearch"
+    "XboxGameCallableUI","PcaSvc","ParentalControls","WpnUserService","BcastDVRUserService",
+    "MessagingService","PimIndexMaintenanceSvc","UnistoreSvc","UserDataSvc","WSearch"
 )
 foreach ($service in $servicesToDisable) {
     Write-Output "Disabling service: $service"
-    & sc.exe config $service start= disabled | Out-Null
-    & sc.exe stop $service | Out-Null
+    Set-ServiceStart $service 4
 }
 
-Write-Output "Removing Biometric Services..."
+Write-Output "Removing Biometric Services (specific files)..."
 Remove-Item -Path "$ScratchDir\Windows\System32\WinBio.dll" -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "$ScratchDir\Windows\System32\winbio*" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "$ScratchDir\Windows\System32\winbio.dat" -Force -ErrorAction SilentlyContinue
 
 Write-Output "Step 8/11: Loading registry..."
 reg load HKLM\zCOMPONENTS "$ScratchDir\Windows\System32\config\COMPONENTS" | Out-Null
@@ -275,6 +305,68 @@ reg load HKLM\zDEFAULT "$ScratchDir\Windows\System32\config\default" | Out-Null
 reg load HKLM\zNTUSER "$ScratchDir\Users\Default\ntuser.dat" | Out-Null
 reg load HKLM\zSOFTWARE "$ScratchDir\Windows\System32\config\SOFTWARE" | Out-Null
 reg load HKLM\zSYSTEM "$ScratchDir\Windows\System32\config\SYSTEM" | Out-Null
+
+# Wallpaper integration
+if ($UseWallpaper) {
+    Write-Output "Integrating custom wallpaper and theme..."
+    
+    # Create Web folder for wallpaper
+    $WebFolder = "$ScratchDir\Windows\Web\Wallpaper\BigE11"
+    New-Item -ItemType Directory -Force -Path $WebFolder | Out-Null
+    
+    # Copy wallpaper
+    Copy-Item -Path $WallpaperSource -Destination "$WebFolder\e11w1.jpg" -Force
+    
+    # Set as default wallpaper in registry
+    Set-RegistryValue 'HKLM\zNTUSER\Control Panel\Desktop' 'Wallpaper' 'REG_SZ' '%SystemRoot%\Web\Wallpaper\BigE11\e11w1.jpg'
+    Set-RegistryValue 'HKLM\zNTUSER\Control Panel\Desktop' 'WallpaperStyle' 'REG_SZ' '2'  # 0=Center, 1=Tile, 2=Stretch, 6=Fit, 10=Fill
+    Set-RegistryValue 'HKLM\zNTUSER\Control Panel\Desktop' 'TileWallpaper' 'REG_SZ' '0'
+    
+    # Set for default user
+    Set-RegistryValue 'HKLM\zDEFAULT\Control Panel\Desktop' 'Wallpaper' 'REG_SZ' '%SystemRoot%\Web\Wallpaper\BigE11\e11w1.jpg'
+    Set-RegistryValue 'HKLM\zDEFAULT\Control Panel\Desktop' 'WallpaperStyle' 'REG_SZ' '2'
+    Set-RegistryValue 'HKLM\zDEFAULT\Control Panel\Desktop' 'TileWallpaper' 'REG_SZ' '0'
+    
+    # Orange theme - dark mode with orange accents
+    # Set theme colors (orange: R=255, G=140, B=0)
+    Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme' 'REG_DWORD' '0'
+    Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'SystemUsesLightTheme' 'REG_DWORD' '0'
+    Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\DWM' 'AccentColor' 'REG_DWORD' '0xFF8C00'  # Orange
+    Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\DWM' 'ColorizationColor' 'REG_DWORD' '0xC4FF8C00'
+    Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\DWM' 'ColorizationAfterglow' 'REG_DWORD' '0xC4FF8C00'
+    Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\DWM' 'ColorizationBlurBalance' 'REG_DWORD' '1'
+    Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\DWM' 'EnableWindowColorization' 'REG_DWORD' '1'
+    
+    # Enable dark mode for default user
+    Set-RegistryValue 'HKLM\zDEFAULT\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme' 'REG_DWORD' '0'
+    Set-RegistryValue 'HKLM\zDEFAULT\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'SystemUsesLightTheme' 'REG_DWORD' '0'
+    Set-RegistryValue 'HKLM\zDEFAULT\SOFTWARE\Microsoft\Windows\DWM' 'AccentColor' 'REG_DWORD' '0xFF8C00'
+    Set-RegistryValue 'HKLM\zDEFAULT\SOFTWARE\Microsoft\Windows\DWM' 'ColorizationColor' 'REG_DWORD' '0xC4FF8C00'
+    
+    # Set orange as system accent color
+    Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Accent' 'AccentColorMenu' 'REG_DWORD' '0xFF8C00'
+    Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Accent' 'StartColorMenu' 'REG_DWORD' '0xFF8C00'
+    
+    # Branding in System Properties
+    Write-Output "Adding BigE11 branding to System Properties..."
+    
+    # Check if OEMInformation exists, create if not
+    $OEMPath = 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation'
+    
+    # Try to set via registry
+    Set-RegistryValue $OEMPath 'Model' 'REG_SZ' 'Optimized by BigE11'
+    Set-RegistryValue $OEMPath 'SupportHours' 'REG_SZ' 'Optimized by BigE11'
+    Set-RegistryValue $OEMPath 'SupportPhone' 'REG_SZ' 'Optimized by BigE11'
+    Set-RegistryValue $OEMPath 'SupportURL' 'REG_SZ' 'Optimized by BigE11'
+    
+    # Alternative: Set in CurrentVersion
+    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion' 'RegisteredOrganization' 'REG_SZ' 'BigE11'
+    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion' 'RegisteredOwner' 'REG_SZ' 'BigE11 User'
+    
+    # Set branding in System (this appears in winver and system properties)
+    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'legalnoticecaption' 'REG_SZ' 'BigE11'
+    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'legalnoticetext' 'REG_SZ' 'This system has been optimized by BigE11'
+}
 
 Write-Output "Applying registry tweaks..."
 Set-RegistryValue 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' 'SV1' 'REG_DWORD' '0'
@@ -307,8 +399,8 @@ Set-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\Conten
 Set-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'SystemPaneSuggestionsEnabled' 'REG_DWORD' '0'
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\PushToInstall' 'DisablePushToInstall' 'REG_DWORD' '1'
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\MRT' 'DontOfferThroughWUAU' 'REG_DWORD' '1'
-Remove-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\Subscriptions'
-Remove-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SuggestedApps'
+Remove-RegistryKey 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\Subscriptions'
+Remove-RegistryKey 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SuggestedApps'
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableConsumerAccountStateContent' 'REG_DWORD' '1'
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableCloudOptimizedContent' 'REG_DWORD' '1'
 
@@ -321,8 +413,8 @@ Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Control\BitLocker' 'PreventDeviceE
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Chat' 'ChatIcon' 'REG_DWORD' '3'
 Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarMn' 'REG_DWORD' '0'
 
-Remove-RegistryValue "HKEY_LOCAL_MACHINE\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge"
-Remove-RegistryValue "HKEY_LOCAL_MACHINE\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge Update"
+Remove-RegistryKey "HKEY_LOCAL_MACHINE\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge"
+Remove-RegistryKey "HKEY_LOCAL_MACHINE\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge Update"
 
 Set-RegistryValue "HKLM\zSOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" "REG_DWORD" "1"
 
@@ -340,8 +432,8 @@ Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\dmwappushservice' 'Start'
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\DevHomeUpdate' 'workCompleted' 'REG_DWORD' '1'
-Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate'
-Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\DevHomeUpdate'
+Remove-RegistryKey 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate'
+Remove-RegistryKey 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\DevHomeUpdate'
 
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 'REG_DWORD' '1'
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Edge' 'HubsSidebarEnabled' 'REG_DWORD' '0'
@@ -431,6 +523,24 @@ bcdedit /set disabledynamictick yes
 powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61
 powercfg -setactive e9a42b02-d5df-448d-aa00-03f14749eb61
 '@
+
+if ($UseWallpaper) {
+    $setupCompleteContent += @'
+
+REM Apply wallpaper and orange theme after first boot
+reg add "HKCU\Control Panel\Desktop" /v Wallpaper /t REG_SZ /d "%SystemRoot%\Web\Wallpaper\BigE11\e11w1.jpg" /f
+reg add "HKCU\Control Panel\Desktop" /v WallpaperStyle /t REG_SZ /d "2" /f
+reg add "HKCU\Control Panel\Desktop" /v TileWallpaper /t REG_SZ /d "0" /f
+reg add "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v AppsUseLightTheme /t REG_DWORD /d 0 /f
+reg add "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v SystemUsesLightTheme /t REG_DWORD /d 0 /f
+reg add "HKCU\SOFTWARE\Microsoft\Windows\DWM" /v AccentColor /t REG_DWORD /d 0xff8c00 /f
+reg add "HKCU\SOFTWARE\Microsoft\Windows\DWM" /v ColorizationColor /t REG_DWORD /d 0xc4ff8c00 /f
+reg add "HKCU\SOFTWARE\Microsoft\Windows\DWM" /v ColorizationAfterglow /t REG_DWORD /d 0xc4ff8c00 /f
+reg add "HKCU\SOFTWARE\Microsoft\Windows\DWM" /v EnableWindowColorization /t REG_DWORD /d 1 /f
+RUNDLL32.EXE USER32.DLL,UpdatePerUserSystemParameters
+'@
+}
+
 $setupCompleteContent | Out-File -FilePath "$setupScriptsDir\SetupComplete.cmd" -Encoding ASCII
 
 Write-Output "Step 10/11: Unmounting and exporting..."
@@ -441,13 +551,19 @@ reg unload HKLM\zSOFTWARE | Out-Null
 reg unload HKLM\zSYSTEM | Out-Null
 
 Write-Output "Cleaning up image..."
-dism.exe /Image:$ScratchDir /Cleanup-Image /StartComponentCleanup /ResetBase | Out-Null
+$result = dism.exe /Image:$ScratchDir /Cleanup-Image /StartComponentCleanup /ResetBase
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Component cleanup exit code: $LASTEXITCODE"
+}
 
 Write-Output "Unmounting image..."
 Dismount-WindowsImage -Path $ScratchDir -Save
 
-Write-Output "Exporting image (fast compression)..."
-Dism.exe /Export-Image /SourceImageFile:"$BigE11Dir\sources\install.wim" /SourceIndex:$index /DestinationImageFile:"$BigE11Dir\sources\install2.wim" | Out-Null
+Write-Output "Exporting image (default compression)..."
+$result = Dism.exe /Export-Image /SourceImageFile:"$BigE11Dir\sources\install.wim" /SourceIndex:$index /DestinationImageFile:"$BigE11Dir\sources\install2.wim"
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Export exit code: $LASTEXITCODE"
+}
 Remove-Item -Path "$BigE11Dir\sources\install.wim" -Force | Out-Null
 Rename-Item -Path "$BigE11Dir\sources\install2.wim" -NewName "install.wim" | Out-Null
 
@@ -456,7 +572,17 @@ $wimFilePath = "$BigE11Dir\sources\boot.wim"
 & takeown "/F" $wimFilePath | Out-Null
 & icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
 Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false
-Mount-WindowsImage -ImagePath "$BigE11Dir\sources\boot.wim" -Index 2 -Path $ScratchDir
+
+$bootIndex = 2
+$bootInfo = Get-WindowsImage -ImagePath $wimFilePath
+if ($bootInfo.ImageIndex -contains 1 -and $bootInfo | Where-Object { $_.ImageIndex -eq 2 }) {
+    $bootIndex = 2
+} else {
+    Write-Output "Using boot index: $($bootInfo.ImageIndex[0])"
+    $bootIndex = $bootInfo.ImageIndex[0]
+}
+
+Mount-WindowsImage -ImagePath "$BigE11Dir\sources\boot.wim" -Index $bootIndex -Path $ScratchDir
 
 reg load HKLM\zDEFAULT "$ScratchDir\Windows\System32\config\default" | Out-Null
 reg load HKLM\zNTUSER "$ScratchDir\Users\Default\ntuser.dat" | Out-Null
@@ -489,7 +615,14 @@ if ([System.IO.Directory]::Exists($ADKDepTools)) {
 } else {
     $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
     if (-not (Test-Path -Path $localOSCDIMGPath)) {
-        Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
+        Write-Output "Downloading oscdimg.exe from symbol server..."
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
+        } catch {
+            Write-Warning "Failed to download oscdimg.exe. ISO creation will fail."
+            Cleanup-Temp
+            exit
+        }
     }
     $OSCDIMG = $localOSCDIMGPath
 }
@@ -518,6 +651,12 @@ Remove-Item -Path "$PSScriptRoot\autounattend.xml" -Force -ErrorAction SilentlyC
 Write-Output "BigE11 creation completed."
 Write-Output "ISO: $PSScriptRoot\BigE11.iso"
 Write-Output "Tool: $toolBatPath"
+
+if ($UseWallpaper) {
+    Write-Output "Custom wallpaper integrated: e11w1.jpg"
+    Write-Output "Orange dark theme applied"
+    Write-Output "BigE11 branding added to System Properties"
+}
 
 Stop-Transcript
 exit

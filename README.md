@@ -1,5 +1,8 @@
 # BigE11
 
+![Uploading w1.jpg…]()
+
+
 BigE11 is a comprehensive Windows 11 ISO optimization script that processes installation media up to version 25H2, producing a streamlined and performance-tuned output image.
 
 ## How to Use

@@ -8,7 +8,7 @@ BigE11 is a comprehensive Windows 11 ISO optimization script that processes inst
 ## How to Use
 
 1. Mount your Windows 11 ISO (must be from an official Microsoft source, preferably unaltered)
-2. Run the script and enter the drive letter assigned to the mounted ISO drive when prompted (e.g., F:)
+2. Run the script and enter the drive letter assigned to the mounted ISO drive when prompted (e.g., F:), note, the w1.jpg is required to be besides the script .ps1 for the OS to have the designated wallpaper.
 
 ## Process Overview
 
